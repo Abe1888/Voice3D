@@ -156,6 +156,7 @@ Contact: +251 11 882 9090 / +251 11 882 9191 | support@translink.et
     private mousePositions: { x: number; y: number; time: number }[] = [];
     private activeHoverElement: string | null = null;
     private sectionTimerInterval: ReturnType<typeof setInterval> | null = null;
+    private sectionChangeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
     constructor() {
         this.lastScrollY = window.scrollY;
@@ -315,13 +316,19 @@ ${userQuery ? `The visitor just said: "${userQuery}". Respond directly, warmly, 
                         this._addBehavioralPattern(`Highly interested in ${newSection}`);
                     }
 
-                    // Silent context update to keep Gemini in sync
-                    if (this.onDecisionCallback) {
-                        const node = this.semanticIndex[newSection];
-                        const hint = node?.productInfo || node?.description || '';
-                        const prompt = `[SILENT UPDATE] The visitor just navigated to "${node?.name || newSection}". Update your context silently. If you're mid-conversation, you may briefly and naturally acknowledge the new section in one casual sentence — something like "Oh, you've moved on to our ${node?.name}!" — then offer one genuinely interesting insight or ask a curious question. Keep it natural. Context: ${hint}`;
-                        this.onDecisionCallback(prompt, 'happy');
+                    // Debounce vocal section change introduction to allow user to settle
+                    if (this.sectionChangeDebounceTimer) {
+                        clearTimeout(this.sectionChangeDebounceTimer);
                     }
+
+                    this.sectionChangeDebounceTimer = setTimeout(() => {
+                        if (this.onDecisionCallback) {
+                            const node = this.semanticIndex[newSection];
+                            const features = node?.features.slice(0, 2).join(' and ') || 'key tech';
+                            const prompt = `The visitor just scrolled to and settled on the "${node?.name || newSection}" section. Introduce this section to them in one warm, enthusiastic, and extremely brief sentence (10-15 words max). Mention its key feature: ${features}. Keep it natural, like "Here is our fuel monitoring system, which stops fuel siphoning with 99.5% accuracy!" or similar, but in your own words.`;
+                            this.onDecisionCallback(prompt, 'happy');
+                        }
+                    }, 1500);
                 }
                 break;
 
@@ -524,6 +531,10 @@ ${userQuery ? `The visitor just said: "${userQuery}". Respond directly, warmly, 
         if (this.sectionTimerInterval) {
             clearInterval(this.sectionTimerInterval);
             this.sectionTimerInterval = null;
+        }
+        if (this.sectionChangeDebounceTimer) {
+            clearTimeout(this.sectionChangeDebounceTimer);
+            this.sectionChangeDebounceTimer = null;
         }
     }
 }

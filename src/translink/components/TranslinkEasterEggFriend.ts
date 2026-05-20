@@ -620,6 +620,7 @@ export class TranslinkEasterEggFriend {
     /* Interactive variables */
     private audioCtx: AudioContext | null = null;
     private isDizzy = false;
+    private isHoldingNotepad = false;
     private scrollTimer: ReturnType<typeof setTimeout> | null = null;
     private scrollIdleTimer: ReturnType<typeof setTimeout> | null = null;
     private wanderTimer: ReturnType<typeof setTimeout> | null = null;
@@ -637,6 +638,14 @@ export class TranslinkEasterEggFriend {
     private welcomeCompleted = false;
     private welcomeGuideDelivered = false;
     private emblemEl: HTMLElement | null = null;
+    // Tracks whether the robot has spoken at least once in the current voice session.
+    // Welcome-complete logic must only fire AFTER the robot has actually spoken,
+    // not on the first 'listening' state that fires when the WebSocket opens.
+    private _robotHasSpoken = false;
+    private _isAutomatedSession = false;
+    private _pendingAutomatedPrompt: string | null = null;
+    private _pendingAutomatedExpression: 'neutral' | 'happy' | 'angry' | 'dizzy' = 'neutral';
+    private _pendingChatGreeting = false;
 
     private constructor() {}
 
@@ -783,6 +792,17 @@ export class TranslinkEasterEggFriend {
             });
         }
 
+        const bodyEl = this.creatureEl.querySelector('.robot-body') as HTMLElement | null;
+        if (bodyEl) {
+            bodyEl.style.cursor = 'pointer';
+            bodyEl.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                console.log('[Companion] Robot body clicked - toggling voice session');
+                this._toggleVoiceSession();
+            });
+        }
+
         // Handle interactive hover pause & cursor eye contact behaviors
         this.creatureEl.addEventListener('mouseenter', () => {
             this._handleHoverStart();
@@ -803,6 +823,7 @@ export class TranslinkEasterEggFriend {
             onStateChange: (state) => this._handleVoiceStateChange(state),
             onTranscription: (text) => this._handleVoiceTranscription(text),
             onError: (err) => this._handleVoiceError(err),
+            onSetupComplete: () => this._onVoiceSetupComplete(),
         });
 
         // Initialize client-side AI Cognition & Memory
@@ -811,7 +832,7 @@ export class TranslinkEasterEggFriend {
             if (this.voiceManager && this.voiceManager.isConnected()) {
                 this.voiceManager.sendText(promptText);
                 this.setExpression(emotion);
-            } else if (emotion === 'angry' || emotion === 'dizzy') {
+            } else {
                 console.log('[Companion] Automatically connecting voice link due to brain decision:', emotion);
                 this._autoConnectAndPrompt(promptText, emotion);
             }
@@ -830,7 +851,16 @@ export class TranslinkEasterEggFriend {
         this._initScrollTracking();
 
         // Rule-D: Automatically welcome every visitor on page load
-        this._playWelcomeSequence();
+        if (!this._hasWelcomedThisSession()) {
+            this._playWelcomeSequence();
+        } else {
+            // Already welcomed this session! Keep her happily floating at home corner without triggering flight or connecting automatically.
+            this.welcomeCompleted = true;
+            this.welcomeGuideDelivered = true;
+            this.state = State.IDLE;
+            this._updateStateClasses('idle', 'neutral');
+            this._startIdleFloat();
+        }
     }
 
     flyToButton(btn: HTMLElement): void {
@@ -1769,15 +1799,34 @@ export class TranslinkEasterEggFriend {
         }
     }
 
+    private _hasWelcomedThisSession(): boolean {
+        try {
+            return sessionStorage.getItem('tl_welcomed') === 'true';
+        } catch {
+            return false;
+        }
+    }
+
+    private _setWelcomedThisSession(): void {
+        try {
+            sessionStorage.setItem('tl_welcomed', 'true');
+        } catch {}
+    }
+
     private _playWelcomeSequence(): void {
-        if (!this.shell || !this.creatureEl || !this.floater) return;
+        if (!this.shell || !this.creatureEl || !this.floater || !this.mover) return;
 
         // Set initial scale to 0 and transparent for a premium pop-in entrance
         gsap.set(this.creatureEl, { scale: 0, opacity: 0 });
+        gsap.set(this.mover, { x: 0, y: 0 });
+
+        this._stopFloat();
 
         const welcomeTl = gsap.timeline({
             delay: 1.0, // wait 1 second after page load for maximum visual impact
             onStart: () => {
+                this.state = State.FLYING;
+                this._updateStateClasses('flying', 'happy');
                 this.setExpression('happy');
                 // Play a gorgeous digital tri-tone welcome melody
                 this._playSynthBeep(523.25, 'sine', 0.15); // C5
@@ -1786,24 +1835,158 @@ export class TranslinkEasterEggFriend {
             }
         });
 
-        // Cinematic pop-in & visual greeting wave!
+        // 1. Cinematic pop-in at home corner
         welcomeTl.to(this.creatureEl, {
             scale: 1,
             opacity: 1,
-            duration: 1.2,
-            ease: 'elastic.out(1, 0.75)',
+            duration: 0.8,
+            ease: 'back.out(1.5)'
+        });
+
+        // Calculate center coordinates relative to home corner anchor
+        const shellRect = this.shell.getBoundingClientRect();
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+        const isAr = TranslinkLanguageController.getInstance().getLanguage() === 'ar';
+        const offsetMultiplier = isAr ? 1 : -1;
+        
+        // Offset horizontally so the welcome notepad (width 250px) centers beautifully alongside the robot
+        const targetX = (vw / 2) - (shellRect.left + shellRect.width / 2) + (offsetMultiplier * 80);
+        const targetY = (vh / 2) - (shellRect.top + shellRect.height / 2) - 40;
+
+        this.prevX = 0;
+        this.prevY = 0;
+
+        // 2. organic curved flight from home corner to center of Section S1
+        welcomeTl.to(this.mover, {
+            duration: 2.0,
+            ease: 'power2.inOut',
+            motionPath: {
+                path: [
+                    { x: targetX * 0.3, y: targetY * 0.5 - 100 }, // curve upward
+                    { x: targetX * 0.7, y: targetY * 0.85 - 50 },
+                    { x: targetX, y: targetY }
+                ],
+                curviness: 1.5,
+                type: 'soft'
+            },
+            onUpdate: () => this._applyProceduralTilt(),
             onComplete: () => {
-                // Automatically activate the live voice connection and welcome the user audibly!
+                this.state = State.PRESENTING;
+                this._updateStateClasses('guiding', 'happy');
+
+                // Settle and reset body velocity tilts smoothly
+                gsap.to(this.tiltWrap, { rotation: 0, duration: 0.4, ease: 'power2.out' });
+                if (this.headEl) {
+                    gsap.to(this.headEl, { rotation: 0, duration: 0.4, ease: 'power2.out' });
+                }
+                gsap.to(this.creatureEl, {
+                    rotationX: 0,
+                    rotationY: 0,
+                    rotationZ: 0,
+                    scaleX: isAr ? -1 : 1,
+                    scaleY: 1,
+                    duration: 0.4,
+                    ease: 'power2.out'
+                });
+                this.facing = 1;
+                this.currentFacing = 1;
+
                 this.welcomeCompleted = false;
+
+                // Build a gorgeous glassmorphic welcome notepad card
+                const lang = TranslinkLanguageController.getInstance();
+                const curLang = lang.getLanguage();
+                let headerText = "TRANSLINK SOLUTIONS";
+                let subText = "Welcome Visitor!";
+                let descText = "Your One-Stop Solution for Fleet Telematics & IoT across East Africa.";
+                let bullets = [
+                    "✓ ECA & FTA Certified",
+                    "✓ GPS & Fuel Monitoring",
+                    "✓ AI-Driven Video Safety",
+                    "✓ 24/7 Support Team"
+                ];
+                let align = 'left';
+
+                if (curLang === 'am') {
+                    headerText = "ትራንስሊንክ መፍትሔዎች";
+                    subText = "እንኳን ደህና መጡ!";
+                    descText = "በምስራቅ አፍሪካ ለተሽከርካሪ ስምሪት ቁጥጥር እና IoT የተሟላ መፍትሔ።";
+                    bullets = [
+                        "✓ በ ECA እና FTA ፈቃድ ያለው",
+                        "✓ የጂፒኤስ እና ነዳጅ ቁጥጥር",
+                        "✓ በ AI የተደገፈ የቪዲዮ ደህንነት",
+                        "✓ የ24/7 የቴክኒክ ድጋፍ"
+                    ];
+                } else if (curLang === 'ar') {
+                    headerText = "ترانسلينك للحلول";
+                    subText = "أهلاً بك زائرنا!";
+                    descText = "حلولك الشاملة لتتبع المركبات و IoT في شرق أفريقيا.";
+                    bullets = [
+                        "✓ مرخص من ECA و FTA",
+                        "✓ تتبع GPS ومراقبة الوقود",
+                        "✓ السلامة بالفيديو المدعوم بالذكاء الاصطناعي",
+                        "✓ دعم فني على مدار الساعة"
+                    ];
+                    align = 'right';
+                }
+
+                const notepad = document.createElement('div');
+                notepad.id = 'tl-welcome-notepad';
+                notepad.className = 'tl-notepad-card';
+                notepad.style.cssText = `
+                    width: 250px;
+                    padding: 16px;
+                    background: linear-gradient(135deg, rgba(20, 20, 25, 0.95) 0%, rgba(10, 10, 12, 0.98) 100%);
+                    border: 1px solid rgba(255, 255, 255, 0.1);
+                    border-radius: 12px;
+                    box-shadow: 0 20px 45px rgba(0, 0, 0, 0.7), inset 0 1px 1px rgba(255, 255, 255, 0.15);
+                    color: #ffffff;
+                    font-family: 'Inter', sans-serif;
+                    text-align: ${align};
+                    pointer-events: auto;
+                    backdrop-filter: blur(10px);
+                    display: flex;
+                    flex-direction: column;
+                    gap: 8px;
+                    direction: ${curLang === 'ar' ? 'rtl' : 'ltr'};
+                `;
+
+                notepad.innerHTML = `
+                    <div style="font-size: 9px; font-weight: 800; letter-spacing: 0.15em; color: var(--brand-crimson); text-transform: uppercase;">
+                        ${headerText}
+                    </div>
+                    <div style="font-size: 16px; font-weight: 900; color: #ffffff;">
+                        ${subText}
+                    </div>
+                    <div style="height: 1px; background: linear-gradient(90deg, var(--brand-crimson), transparent); margin: 2px 0;"></div>
+                    <p style="font-size: 11px; color: #94a3b8; line-height: 1.4; margin: 0; padding: 0;">
+                        ${descText}
+                    </p>
+                    <ul style="list-style: none; padding: 0; margin: 4px 0 0 0; display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: #e2e8f0; font-weight: 500; text-align: ${align};">
+                        ${bullets.map(b => `<li style="display: flex; align-items: center; gap: 6px; justify-content: ${align === 'right' ? 'flex-end' : 'flex-start'};">${b}</li>`).join('')}
+                    </ul>
+                `;
+
+                if (this.buttonSlot) {
+                    this.buttonSlot.innerHTML = '';
+                    this.buttonSlot.appendChild(notepad);
+                    this.isHoldingNotepad = true;
+                    this.state = State.PRESENTING;
+                    this._animateButtonPresentation();
+                }
+
+                // BUG FIX #1: Automatically connect and play the welcome — but pass welcome=false
+                // because we are sending the prompt text ourselves via sendText().
+                // Passing welcome=true would cause the SERVER to also fire its own welcome prompt, doubling it.
                 this._autoConnectAndPrompt(
                     `Welcome the visitor warmly. In your greeting, clearly say that Translink is the ONE STOP SOLUTION for fleet telematics, GPS tracking, fuel management, and AI-driven safety across East Africa. Emphasize "One Stop Solution" — say it with pride and energy, like it's our tagline. Keep it to 2 short, natural sentences. Sound genuinely excited, like a colleague who loves what we do. Invite them to ask anything.`,
                     "happy"
                 );
             }
-        });
+        }, '-=0.2');
 
         // Cute greeting hand wave sequence
-        const isAr = TranslinkLanguageController.getInstance().getLanguage() === 'ar';
         const activeHand = this.creatureEl.querySelector(
             isAr ? '.robot-hand.r' : '.robot-hand.l'
         ) as HTMLElement | null;
@@ -1831,6 +2014,12 @@ export class TranslinkEasterEggFriend {
             }
             if (this.scrollIdleTimer) {
                 clearTimeout(this.scrollIdleTimer);
+            }
+
+            // If we are holding the welcome notepad and user scrolls past S1, return home
+            if (this.isHoldingNotepad && window.scrollY > 50 && this.state === State.PRESENTING) {
+                this.isHoldingNotepad = false;
+                this.returnHome();
             }
 
             // --- Scroll interaction state synchronization for Telemetry Button ---
@@ -2026,19 +2215,28 @@ export class TranslinkEasterEggFriend {
         });
     }
 
-    private _toggleVoiceSession(): void {
+    private async _toggleVoiceSession(): Promise<void> {
         if (!this.voiceManager) return;
 
-        if (this.voiceManager.isConnected()) {
-            console.log('[Companion] Requesting voice disconnect');
-            this.voiceManager.disconnect();
-        } else {
-            console.log('[Companion] Requesting voice connect');
-            this.voiceManager.connect();
-            if (this.brain) {
-                this.brain.makeDecision('voice_link_open');
-            }
+        const vm = this.voiceManager;
+
+        if (vm.isConnected()) {
+            // Session active: disconnect it on second click (acts as toggle-off)
+            console.log('[Companion] Emblem clicked — voice session active, disconnecting.');
+            vm.disconnect();
+            return;
         }
+
+        console.log('[Companion] Emblem clicked — initiating chat voice session.');
+        this._setWelcomedThisSession();
+        if (this.brain) {
+            this.brain.makeDecision('voice_link_open');
+        }
+
+        this._isAutomatedSession = false;
+        this._pendingChatGreeting = true;
+        this._pendingAutomatedPrompt = null;
+        await vm.connect(false, true);
     }
 
     private _handleVoiceStateChange(voiceState: VoiceState): void {
@@ -2055,36 +2253,56 @@ export class TranslinkEasterEggFriend {
                 this._stopLipSync();
                 this._updateStateClasses('listening', 'happy');
 
-                // After the welcome message finishes speaking, guide the visitor to click the red logo
-                if (!this.welcomeCompleted && !this.welcomeGuideDelivered) {
-                    this.welcomeCompleted = true;
-                    this.welcomeGuideDelivered = true;
+                // Welcome-complete guard: only fires AFTER _robotHasSpoken is true.
+                // _robotHasSpoken is set when the first 'speaking' state fires.
+                // This prevents the guide prompt and auto-disconnect from triggering
+                // on the initial WS open (which also emits a 'listening' state).
+                if (this._isAutomatedSession) {
+                    if (!this.welcomeGuideDelivered && this._robotHasSpoken) {
+                        this.welcomeCompleted = true;
+                        this.welcomeGuideDelivered = true;
+                        // Safe to mark welcomed NOW — robot has actually spoken.
+                        this._setWelcomedThisSession();
 
-                    // Start pulsing the emblem to visually guide the visitor
-                    if (this.emblemEl) {
-                        this.emblemEl.classList.add('emblem-pulse-guide');
-                    }
-
-                    // Send a follow-up voice instruction after a brief natural pause
-                    setTimeout(() => {
-                        if (this.voiceManager && this.voiceManager.isConnected()) {
-                            this.voiceManager.sendText(
-                                `Now gently tell the visitor: to start talking with you, they just need to click the glowing red Translink logo on your body. Say it naturally and warmly in one short sentence — like "Just tap my red Translink logo right here on my chest, and we can start chatting!" Use your own words, be charming and inviting.`
-                            );
-                            this.setExpression('happy');
+                        // Pulse the emblem to guide visitor to click it.
+                        if (this.emblemEl) {
+                            this.emblemEl.classList.add('emblem-pulse-guide');
                         }
-                    }, 1200);
+
+                        // Guide prompt fires after welcome speaking ends (we are now in listening).
+                        setTimeout(() => {
+                            if (this.voiceManager && this.voiceManager.isConnected()) {
+                                this.voiceManager.sendText(
+                                    `Now gently tell the visitor: to start talking with you, they just need to click the glowing red Translink logo on your body. Say it naturally and warmly in one short sentence — like "Just tap my red Translink logo right here on my chest, and we can start chatting!" Use your own words, be charming and inviting.`
+                                );
+                                this.setExpression('happy');
+                            }
+                        }, 800);
+                    } else if (this.welcomeGuideDelivered && this.welcomeCompleted && this._robotHasSpoken) {
+                        // This is triggered the moment the guide speech finishes playing and state transitions back to 'listening'!
+                        console.log('[Companion] Guide verbal announcement complete — disconnecting, returning to idle.');
+                        this.returnHome();
+                        if (this.voiceManager && this.voiceManager.isConnected()) {
+                            this.voiceManager.disconnect();
+                        }
+                    }
                 }
                 break;
 
             case 'speaking':
+                // Mark that the robot has spoken at least once in this session.
+                // This is the gate that unlocks the welcome-complete logic above.
+                this._robotHasSpoken = true;
                 this._startLipSync();
                 this._updateStateClasses('speaking', 'happy');
                 break;
 
             case 'idle':
                 this._stopLipSync();
-                this._updateStateClasses('idle', 'neutral');
+                this._robotHasSpoken = false; // reset for next session
+                if (this.state === State.IDLE || this.state === State.RETURNING) {
+                    this._updateStateClasses('idle', 'neutral');
+                }
                 this._playSynthBeep(250, 'sine', 0.2);
                 break;
         }
@@ -2174,22 +2392,41 @@ export class TranslinkEasterEggFriend {
         }
     }
 
+    private _onVoiceSetupComplete(): void {
+        if (!this.voiceManager) return;
+
+        console.log('[Companion] Voice session setup complete. Handling pending queues.');
+        if (this._pendingChatGreeting) {
+            this._pendingChatGreeting = false;
+            this.voiceManager.sendText(
+                `The visitor has just clicked to start a conversation with you. Greet them naturally and warmly — like picking up where you left off. Ask if there's anything specific you can help them with today. Keep it to one friendly, conversational sentence. Don't re-introduce yourself or re-play the welcome.`
+            );
+            this.setExpression('happy');
+            this._playSynthBeep(440, 'sine', 0.15);
+        } else if (this._pendingAutomatedPrompt) {
+            const prompt = this._pendingAutomatedPrompt;
+            const expr = this._pendingAutomatedExpression;
+            this._pendingAutomatedPrompt = null;
+
+            this.voiceManager.sendText(prompt);
+            this.setExpression(expr);
+        }
+    }
+
     private _autoConnectAndPrompt(promptText: string, emotion: 'neutral' | 'happy' | 'angry' | 'dizzy'): void {
         if (!this.voiceManager) return;
         this.setExpression(emotion);
-        
-        // Return home first if wandering, so she is fully visible to say the prompt
+
         if (this.isWandering && this.state === State.IDLE) {
             this._returnFromWander();
         }
 
-        this.voiceManager.connect().then(() => {
-            setTimeout(() => {
-                if (this.voiceManager && this.voiceManager.isConnected()) {
-                    this.voiceManager.sendText(promptText);
-                }
-            }, 800);
-        }).catch(err => {
+        this._isAutomatedSession = true;
+        this._pendingChatGreeting = false;
+        this._pendingAutomatedPrompt = promptText;
+        this._pendingAutomatedExpression = emotion;
+
+        this.voiceManager.connect(false, false).catch(err => {
             console.error('[Companion] Failed auto connect voice:', err);
         });
     }

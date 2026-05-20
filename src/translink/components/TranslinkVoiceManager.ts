@@ -1,4 +1,8 @@
 import { pcmToBase64, base64ToFloat32 } from './audio-utils';
+
+// Module-level registry: tracks which AudioContext instances have already had
+// 'microphone-processor' registered. Prevents NotSupportedError on reconnection.
+const _workletRegisteredContexts = new WeakSet<AudioContext>();
 import { TranslinkLanguageController } from '../controllers/TranslinkLanguageController';
 
 export type VoiceState = 'idle' | 'connecting' | 'listening' | 'speaking';
@@ -7,6 +11,7 @@ export interface VoiceManagerCallbacks {
     onStateChange?: (state: VoiceState) => void;
     onTranscription?: (text: string) => void;
     onError?: (error: string) => void;
+    onSetupComplete?: () => void;
 }
 
 const INPUT_SAMPLE_RATE = 16000;
@@ -34,9 +39,11 @@ export class TranslinkVoiceManager {
     private callbacks: VoiceManagerCallbacks = {};
     private mediaStream: MediaStream | null = null;
     private workletNode: AudioWorkletNode | null = null;
+    private workletMonitorGain: GainNode | null = null;
     private sourceNode: MediaStreamAudioSourceNode | null = null;
     private activeAudioSources: Set<AudioBufferSourceNode> = new Set();
     private playbackAnalyser: AnalyserNode | null = null;
+    private _turnCompleteReceived = false;
 
     constructor(callbacks: VoiceManagerCallbacks = {}) {
         this.callbacks = callbacks;
@@ -49,7 +56,7 @@ export class TranslinkVoiceManager {
         }
     }
 
-    async connect(): Promise<void> {
+    async connect(welcome: boolean = true, enableMic: boolean = true, onConnected?: () => void): Promise<void> {
         if (this.ws) return;
 
         this._changeState('connecting');
@@ -59,6 +66,9 @@ export class TranslinkVoiceManager {
             if (!this.audioCtx) {
                 const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
                 this.audioCtx = new AudioContextClass();
+            }
+            if (this.audioCtx.state === 'suspended') {
+                await this.audioCtx.resume().catch(() => {});
             }
             if (!this.playbackAnalyser) {
                 this.playbackAnalyser = this.audioCtx.createAnalyser();
@@ -73,14 +83,14 @@ export class TranslinkVoiceManager {
             const envBackendUrl = (import.meta.env as any).VITE_WS_BACKEND_URL;
             if (envBackendUrl) {
                 if (envBackendUrl.startsWith('ws:') || envBackendUrl.startsWith('wss:')) {
-                    wsUrl = `${envBackendUrl}/ws/live?lang=${encodeURIComponent(lang)}`;
+                    wsUrl = `${envBackendUrl}/ws/live?lang=${encodeURIComponent(lang)}&welcome=${welcome}`;
                 } else {
                     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-                    wsUrl = `${protocol}//${envBackendUrl}/ws/live?lang=${encodeURIComponent(lang)}`;
+                    wsUrl = `${protocol}//${envBackendUrl}/ws/live?lang=${encodeURIComponent(lang)}&welcome=${welcome}`;
                 }
             } else {
                 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-                wsUrl = `${protocol}//${window.location.host}/ws/live?lang=${encodeURIComponent(lang)}`;
+                wsUrl = `${protocol}//${window.location.host}/ws/live?lang=${encodeURIComponent(lang)}&welcome=${welcome}`;
             }
 
             console.log('[VoiceManager] Connecting to WebSocket:', wsUrl);
@@ -89,7 +99,14 @@ export class TranslinkVoiceManager {
             this.ws.onopen = () => {
                 console.log('[VoiceManager] WebSocket connected');
                 this._changeState('listening');
-                this._startMicrophone();
+                if (enableMic) {
+                    this._startMicrophone();
+                } else {
+                    console.log('[VoiceManager] Microphone stream disabled for output-only announcements');
+                }
+                // Notify caller the moment the socket is confirmed open and ready.
+                // This is the only safe point to send the first text prompt.
+                if (onConnected) onConnected();
             };
 
             this.ws.onmessage = async (event) => {
@@ -101,6 +118,13 @@ export class TranslinkVoiceManager {
                         if (this.callbacks.onError) this.callbacks.onError(msg.error);
                         this.disconnect();
                         return;
+                    }
+
+                    if (msg.setupComplete) {
+                        console.log('[VoiceManager] Server setup complete received');
+                        if (this.callbacks.onSetupComplete) {
+                            this.callbacks.onSetupComplete();
+                        }
                     }
 
                     if (msg.audio) {
@@ -117,7 +141,10 @@ export class TranslinkVoiceManager {
                     }
 
                     if (msg.turnComplete) {
-                        this._changeState('listening');
+                        this._turnCompleteReceived = true;
+                        if (this.activeAudioSources.size === 0) {
+                            this._changeState('listening');
+                        }
                     }
                 } catch (err) {
                     console.error('[VoiceManager] Error parsing message:', err);
@@ -145,6 +172,7 @@ export class TranslinkVoiceManager {
     disconnect(): void {
         this._stopMicrophone();
         this._stopPlayback();
+        this._turnCompleteReceived = false;
 
         if (this.ws) {
             if (
@@ -166,16 +194,23 @@ export class TranslinkVoiceManager {
             this.mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
             this.sourceNode = this.audioCtx.createMediaStreamSource(this.mediaStream);
 
-            // Register inline AudioWorklet module dynamically
-            const blob = new Blob([AUDIO_WORKLET_CODE], { type: 'application/javascript' });
-            const workletUrl = URL.createObjectURL(blob);
-            await this.audioCtx.audioWorklet.addModule(workletUrl);
-            URL.revokeObjectURL(workletUrl);
+            // Register inline AudioWorklet module — guarded by WeakSet to prevent
+            // NotSupportedError: 'microphone-processor already registered' on reconnect.
+            if (!_workletRegisteredContexts.has(this.audioCtx)) {
+                const blob = new Blob([AUDIO_WORKLET_CODE], { type: 'application/javascript' });
+                const workletUrl = URL.createObjectURL(blob);
+                await this.audioCtx.audioWorklet.addModule(workletUrl);
+                URL.revokeObjectURL(workletUrl);
+                _workletRegisteredContexts.add(this.audioCtx);
+            }
 
             this.workletNode = new AudioWorkletNode(this.audioCtx, 'microphone-processor');
 
             this.sourceNode.connect(this.workletNode);
-            this.workletNode.connect(this.audioCtx.destination);
+            this.workletMonitorGain = this.audioCtx.createGain();
+            this.workletMonitorGain.gain.value = 0;
+            this.workletNode.connect(this.workletMonitorGain);
+            this.workletMonitorGain.connect(this.audioCtx.destination);
 
             this.workletNode.port.onmessage = (e) => {
                 if (this.ws && this.ws.readyState === WebSocket.OPEN) {
@@ -195,7 +230,11 @@ export class TranslinkVoiceManager {
                     }
 
                     const base64Audio = pcmToBase64(resampledData);
-                    this.ws.send(JSON.stringify({ audio: base64Audio }));
+
+                    this.ws.send(JSON.stringify({
+                        audio: base64Audio,
+                        mimeType: `audio/pcm;rate=${INPUT_SAMPLE_RATE}`,
+                    }));
                 }
             };
 
@@ -215,6 +254,10 @@ export class TranslinkVoiceManager {
             this.workletNode.disconnect();
             this.workletNode = null;
         }
+        if (this.workletMonitorGain) {
+            this.workletMonitorGain.disconnect();
+            this.workletMonitorGain = null;
+        }
         if (this.sourceNode) {
             this.sourceNode.disconnect();
             this.sourceNode = null;
@@ -224,6 +267,7 @@ export class TranslinkVoiceManager {
 
     private _playAudioChunk(base64Audio: string): void {
         if (!this.audioCtx) return;
+        this._turnCompleteReceived = false;
 
         if (this.audioCtx.state === 'suspended') {
             this.audioCtx.resume().catch(() => {});
@@ -247,7 +291,7 @@ export class TranslinkVoiceManager {
         this.activeAudioSources.add(source);
         source.onended = () => {
             this.activeAudioSources.delete(source);
-            if (this.activeAudioSources.size === 0 && this.state === 'speaking') {
+            if (this.activeAudioSources.size === 0 && this._turnCompleteReceived && this.state === 'speaking') {
                 this._changeState('listening');
             }
         };
@@ -257,6 +301,7 @@ export class TranslinkVoiceManager {
     }
 
     private _stopPlayback(): void {
+        this._turnCompleteReceived = false;
         this.activeAudioSources.forEach((src) => {
             try {
                 src.stop();
@@ -279,6 +324,7 @@ export class TranslinkVoiceManager {
 
     sendText(text: string): void {
         if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this._changeState('connecting');
             console.log('[VoiceManager] Sending text context to server:', text);
             this.ws.send(JSON.stringify({ text }));
         }
@@ -295,5 +341,14 @@ export class TranslinkVoiceManager {
             sum += val * val;
         }
         return Math.sqrt(sum / dataArray.length);
+    }
+
+    isMicrophoneActive(): boolean {
+        return this.mediaStream !== null;
+    }
+
+    async startMicrophoneIfInactive(): Promise<void> {
+        if (this.mediaStream) return;
+        await this._startMicrophone();
     }
 }
