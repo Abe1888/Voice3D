@@ -18,11 +18,42 @@ export class GeminiLiveService {
     });
   }
 
-  async handleConnection(clientWs: WebSocket, lang: string = 'en', selectedVoice: string = 'Zephyr') {
+  async handleConnection(clientWs: WebSocket, lang: string = 'en', selectedVoice: string = 'Zephyr', welcome: boolean = true) {
     const sessionId = uuidv4();
-    console.log(`[GeminiLive] New session: ${sessionId} (Lang: ${lang})`);
+    console.log(`[GeminiLive] New session: ${sessionId} (Lang: ${lang}, Welcome: ${welcome})`);
 
     let session: any;
+    let sessionReady = false;
+    const queuedMessages: any[] = [];
+
+    // Register message handler immediately so we never miss or drop any message
+    // (such as initial text context) sent during the async connection setup!
+    clientWs.on('message', (data: any) => {
+      if (!sessionReady) {
+        try {
+          const msg = JSON.parse(data.toString());
+          if (msg.text) {
+            console.log(`[GeminiLive] Queued text prompt for session ${sessionId} during connection setup: ${msg.text.substring(0, 60)}...`);
+            queuedMessages.push(data);
+          }
+        } catch (e) {
+          // Ignore unparsable or raw audio chunks during connection setup
+        }
+        return;
+      }
+      this.processClientMessage(session, sessionId, data, clientWs);
+    });
+
+    clientWs.on("close", () => {
+      console.log(`[GeminiLive] Session ${sessionId} closed`);
+      if (session) {
+        try {
+          session.close();
+        } catch (e) {
+          console.error(`[GeminiLive] Error closing session ${sessionId}:`, e);
+        }
+      }
+    });
 
     try {
       session = await this.ai.live.connect({
@@ -35,69 +66,127 @@ export class GeminiLiveService {
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: selectedVoice } },
           },
-          systemInstruction: this.getSystemInstruction(lang),
+          systemInstruction: { parts: [{ text: this.getSystemInstruction(lang) }] },
         }
       });
 
-      // Initial prompt — natural, warm, human-like welcome
-      let initialPrompt = `Welcome the visitor warmly. In your greeting, proudly say that Translink is your ONE STOP SOLUTION for fleet telematics, GPS tracking, fuel management, and AI-driven safety across East Africa. Emphasize "One Stop Solution" with pride and energy — it's our tagline. Keep it to 2 short, natural sentences. Sound genuinely excited, like a colleague who loves what we do. Invite them to ask anything.`;
-      if (lang === 'ar') {
-        initialPrompt = `رحّب بالزائر بحرارة. في تحيتك، قل بفخر أن ترانسلينك هي الحل الشامل الوحيد — ONE STOP SOLUTION — لتيليماتكس الأساطيل وتتبع GPS وإدارة الوقود والسلامة المدعومة بالذكاء الاصطناعي في شرق أفريقيا. شدد على "الحل الشامل الوحيد" بفخر وحماس. جملتان قصيرتان فقط. تحدث بالعربية الفصيحة بأسلوب طبيعي.`;
-      } else if (lang === 'am') {
-        initialPrompt = `ጎብኝውን በሞቅ ልብ ተቀበሏቸው። ሰላምታዎ ውስጥ ትራንስሊንክ በምስራቅ አፍሪካ ለፍሊት ቴሌማቲክስ፣ GPS ክትትል፣ የነዳጅ ቁጥጥር እና AI ደህንነት ONE STOP SOLUTION — ሁሉንም በአንድ ቦታ — መሆኑን በኩራት ይናገሩ። "One Stop Solution" ን አጽንኦት ይስጡ። 2 አጫጭር ተፈጥሮአዊ ዓረፍተ ነገሮች ብቻ። በደመቀ አማርኛ ይናገሩ።`;
+      // Mark session as ready and drain queued messages
+      sessionReady = true;
+      console.log(`[GeminiLive] Session ${sessionId} connected successfully. Processing ${queuedMessages.length} queued messages.`);
+      for (const data of queuedMessages) {
+        this.processClientMessage(session, sessionId, data, clientWs);
       }
-      
-      session.sendRealtimeInput({ text: initialPrompt });
-      
-      console.log(`[GeminiLive] Session ${sessionId} connected successfully`);
+
+      if (welcome) {
+        // Initial prompt — natural, warm, human-like welcome
+        let initialPrompt = `Welcome the visitor warmly. In your greeting, proudly say that Translink is your ONE STOP SOLUTION for fleet telematics, GPS tracking, fuel management, and AI-driven safety across East Africa. Emphasize "One Stop Solution" with pride and energy — it's our tagline. Keep it to 2 short, natural sentences. Sound genuinely excited, like a colleague who loves what we do. Invite them to ask anything.`;
+        if (lang === 'ar') {
+          initialPrompt = `رحّب بالزائر بحرارة. في تحيتك، قل بفخر أن ترانسلينك هي الحل الشامل الوحيد — ONE STOP SOLUTION — لتيليماتكس الأساطيل وتتبع GPS وإدارة الوقود والسلامة المدعومة بالذكاء الاصطناعي في شرق أفريقيا. شدد على "الحل الشامل الوحيد" بفخر وحماس. جملتان قصيرتان فقط. تحدث بالعربية الفصيحة بأسلوب طبيعي.`;
+        } else if (lang === 'am') {
+          initialPrompt = `ጎብኝውን በሞቅ ልብ ተቀበሏቸው። ሰላምታዎ ውስጥ ትራንስሊንክ በምስራቅ አፍሪካ ለፍሊት ቴሌማቲክስ፣ GPS ክትትል፣ የነዳጅ ቁጥጥር እና AI ደህንነት ONE STOP SOLUTION — ሁሉንም በአንድ ቦታ — መሆኑን በኩራት ይናገሩ። "One Stop Solution" ን አጽንኦት ይስጡ። 2 አጫጭር ተፈጥሮአዊ ዓረፍተ ነገሮች ብቻ። በደመቀ አማርኛ ይናገሩ።`;
+        }
+        
+        // Wait a moment for connection stabilization
+        setTimeout(() => {
+          if (!session) return;
+          
+          console.log(`[GeminiLive] Sending initial welcome prompt to session ${sessionId}`);
+          
+          // Use sendClientContent instead of sendRealtimeInput for guaranteed text prompt processing
+          // and correct conversational context initialization.
+          session.sendClientContent({
+            turns: [{ role: 'user', parts: [{ text: initialPrompt }] }],
+            turnComplete: true
+          });
+        }, 500);
+      } else {
+        console.log(`[GeminiLive] Skipping initial welcome prompt for session ${sessionId} as welcome has already played.`);
+      }
+
     } catch (error: any) {
       console.error(`[GeminiLive] Connection failed for ${sessionId}:`, error);
       clientWs.send(JSON.stringify({ error: error.message || "Failed to connect to AI Service" }));
       clientWs.close();
-      return;
     }
+  }
 
-    clientWs.on("message", (data) => {
-      try {
-        const msg = JSON.parse(data.toString());
-        // Handle live microphone audio stream
-        if (msg.audio && session) {
+  private processClientMessage(session: any, sessionId: string, data: any, clientWs: WebSocket) {
+    if (!session) return;
+    
+    try {
+      const msg = JSON.parse(data.toString());
+      if (msg.audio) {
+        session.sendRealtimeInput({
+          audio: {
+            data: msg.audio,
+            mimeType: msg.mimeType || "audio/pcm;rate=16000",
+          },
+        });
+      }
+
+      if (msg.realtimeInput && msg.realtimeInput.mediaChunks) {
+        // Backward-compatible path for older Robot client builds.
+        const chunks = msg.realtimeInput.mediaChunks;
+        for (const chunk of chunks) {
           session.sendRealtimeInput({
-            audio: { data: msg.audio, mimeType: "audio/pcm;rate=16000" },
+            audio: {
+              mimeType: chunk.mimeType,
+              data: chunk.data,
+            },
           });
         }
-        // CRITICAL FIX: Handle text prompts from TranslinkAIBrain (welcome, section context, scroll events, etc.)
-        // Previously these were silently dropped — now forwarded to the Gemini session so the AI can respond!
-        if (msg.text && session) {
-          console.log(`[GeminiLive] Forwarding text prompt to Gemini session ${sessionId}:`, msg.text.substring(0, 80) + '...');
-          session.sendRealtimeInput({ text: msg.text });
-        }
-      } catch (error) {
-        console.error(`[GeminiLive] Error processing client message in ${sessionId}:`, error);
       }
-    });
-
-    clientWs.on("close", () => {
-      console.log(`[GeminiLive] Session ${sessionId} closed`);
-      if (session) session.close();
-    });
+      
+      if (msg.text && session) {
+        console.log(`[GeminiLive] Forwarding text prompt to Gemini session ${sessionId}:`, msg.text.substring(0, 80) + '...');
+        session.sendClientContent({
+          turns: [{ role: 'user', parts: [{ text: msg.text }] }],
+          turnComplete: true
+        });
+      }
+    } catch (e) {
+      console.error(`[GeminiLive] Error parsing client message for session ${sessionId}:`, e);
+    }
   }
 
   private handleServerMessage(clientWs: WebSocket, sessionId: string, message: LiveServerMessage) {
+    console.log(`[GeminiLive] Received server message for session ${sessionId}:`, JSON.stringify(message).substring(0, 200) + '...');
+    
+    // Check for error in the message
+    if ((message as any).error) {
+      console.error(`[GeminiLive] API Server error for session ${sessionId}:`, (message as any).error);
+      clientWs.send(JSON.stringify({ error: (message as any).error.message || "Gemini Live API error" }));
+      return;
+    }
+
+    // Notify setup complete
+    if ((message as any).setupComplete) {
+      console.log(`[GeminiLive] Session ${sessionId} setup complete. Notifying client.`);
+      clientWs.send(JSON.stringify({ setupComplete: true }));
+      return;
+    }
+
     // 1. Forward Audio
     if (message.serverContent?.modelTurn?.parts) {
+      let audioPartsCount = 0;
       for (const part of message.serverContent.modelTurn.parts) {
         if (part.inlineData?.data) {
+          audioPartsCount++;
           clientWs.send(JSON.stringify({ audio: part.inlineData.data }));
         }
+      }
+      if (audioPartsCount > 0) {
+        console.log(`[GeminiLive] Forwarded ${audioPartsCount} audio chunks to client for session ${sessionId}`);
       }
     }
 
     // 2. Handle Flags
     if (message.serverContent?.interrupted) {
+      console.log(`[GeminiLive] Session ${sessionId} interrupted by client`);
       clientWs.send(JSON.stringify({ interrupted: true }));
     }
     if (message.serverContent?.turnComplete) {
+      console.log(`[GeminiLive] Turn complete for session ${sessionId}`);
       clientWs.send(JSON.stringify({ turnComplete: true }));
     }
 
@@ -105,6 +194,7 @@ export class GeminiLiveService {
     if (message.serverContent?.modelTurn?.parts) {
       const text = message.serverContent.modelTurn.parts.map(p => p.text).filter(Boolean).join("");
       if (text) {
+        console.log(`[GeminiLive] Received text transcription for session ${sessionId}: ${text}`);
         clientWs.send(JSON.stringify({ text }));
         knowledgeBridge.recordInteraction(sessionId, "User audio was processed", text);
       }

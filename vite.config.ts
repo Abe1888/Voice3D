@@ -34,12 +34,17 @@ function geminiVoicePlugin() {
 
         // Parse query parameters
         let lang = 'en';
+        let welcome = true;
         try {
           const url = new URL(request.url, 'http://localhost');
           const rawLang = url.searchParams.get('lang') || 'en';
           lang = rawLang.toLowerCase();
           if (lang !== 'en' && lang !== 'am' && lang !== 'ar') {
             lang = 'en';
+          }
+          const rawWelcome = url.searchParams.get('welcome');
+          if (rawWelcome === 'false') {
+            welcome = false;
           }
         } catch (e) {
           console.error('[Vite Live Voice] Error parsing request URL:', e);
@@ -69,7 +74,7 @@ function geminiVoicePlugin() {
           // Offload all heavy lifting to the new modular server directory!
           const { GeminiLiveService } = await import('./server/services/GeminiLiveService.ts');
           const service = new GeminiLiveService(apiKey);
-          await service.handleConnection(clientWs, lang, selectedVoice);
+          await service.handleConnection(clientWs, lang, selectedVoice, welcome);
         } catch (err) {
           console.error('[Vite Live Voice] Failed to instantiate modular GeminiLiveService:', err);
           clientWs.close();

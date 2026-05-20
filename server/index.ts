@@ -81,12 +81,17 @@ wss.on('connection', async (clientWs, request) => {
   console.log('[Server] Client connected to WebSocket');
 
   let lang = 'en';
+  let welcome = true;
   try {
     const url = new URL(request.url || '', `http://${request.headers.host || 'localhost'}`);
     const rawLang = url.searchParams.get('lang') || 'en';
     lang = rawLang.toLowerCase();
     if (lang !== 'en' && lang !== 'am' && lang !== 'ar') {
       lang = 'en';
+    }
+    const rawWelcome = url.searchParams.get('welcome');
+    if (rawWelcome === 'false') {
+      welcome = false;
     }
   } catch (e) {
     console.error('[Server] Error parsing connection request URL lang param:', e);
@@ -113,8 +118,8 @@ wss.on('connection', async (clientWs, request) => {
   }
 
   try {
-    console.log(`[Server] Handing off client to GeminiLiveService (lang: ${lang}, voice: ${selectedVoice})`);
-    await service.handleConnection(clientWs, lang, selectedVoice);
+    console.log(`[Server] Handing off client to GeminiLiveService (lang: ${lang}, voice: ${selectedVoice}, welcome: ${welcome})`);
+    await service.handleConnection(clientWs, lang, selectedVoice, welcome);
   } catch (err) {
     console.error('[Server] GeminiLiveService connection handoff failed:', err);
     clientWs.send(JSON.stringify({ error: 'Failed to initialize AI Service' }));

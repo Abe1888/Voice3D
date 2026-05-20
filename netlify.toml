@@ -15,12 +15,12 @@
   [headers.values]
     # Fixed CSP for WebAssembly (Meshopt Decoder) and External Fonts
     # 'wasm-unsafe-eval' is required for Three.js Meshopt/Draco loaders to function correctly.
-    Content-Security-Policy = "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self';"
+    Content-Security-Policy = "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' wss: https:; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self';"
     X-Frame-Options = "DENY"
     X-Content-Type-Options = "nosniff"
     X-XSS-Protection = "1; mode=block"
     Referrer-Policy = "strict-origin-when-cross-origin"
-    Permissions-Policy = "camera=(), microphone=(), geolocation=(), autoplay=(*)"
+    Permissions-Policy = "camera=(), microphone=(self), geolocation=(), autoplay=(*)"
 
 [[headers]]
   for = "/*.glb"
