@@ -10,7 +10,6 @@
  * IMPORTANT: Uses threshold: 0.0 with rootMargin to detect scroll depth,
  * because sections taller than the viewport can NEVER reach threshold: 0.50.
  */
-import { TranslinkEasterEggFriend } from './TranslinkEasterEggFriend';
 import { TranslinkLanguageController } from '../controllers/TranslinkLanguageController';
 
 export class TranslinkTelemetryButton {
@@ -74,15 +73,23 @@ export class TranslinkTelemetryButton {
             const flyObserver = new IntersectionObserver(
                 (entries) => {
                     for (const entry of entries) {
-                        const companion = TranslinkEasterEggFriend.getInstance();
+                        if (!document.getElementById('tl-companion')) {
+                            return;
+                        }
                         if (entry.isIntersecting && !companionFlying) {
                             companionFlying = true;
-                            companion.flyToButton(btn);
-                            console.log(`[TelemetryButton] ${this.id} companion flying to button`);
+                            void import('./TranslinkEasterEggFriend').then(({ TranslinkEasterEggFriend }) => {
+                                const companion = TranslinkEasterEggFriend.getInstance();
+                                companion.flyToButton(btn);
+                                console.log(`[TelemetryButton] ${this.id} companion flying to button`);
+                            });
                         } else if (!entry.isIntersecting && companionFlying) {
                             companionFlying = false;
-                            companion.returnHome();
-                            console.log(`[TelemetryButton] ${this.id} companion returning home`);
+                            void import('./TranslinkEasterEggFriend').then(({ TranslinkEasterEggFriend }) => {
+                                const companion = TranslinkEasterEggFriend.getInstance();
+                                companion.returnHome();
+                                console.log(`[TelemetryButton] ${this.id} companion returning home`);
+                            });
                         }
                     }
                 },
