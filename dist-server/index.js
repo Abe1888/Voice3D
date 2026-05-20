@@ -6,11 +6,17 @@ import fs from 'fs';
 import dotenv from 'dotenv';
 import apiRouter from './routes/api';
 import { GeminiLiveService } from './services/GeminiLiveService';
+import { rateLimitService } from './services/RateLimitService';
 // Load environment variables
 dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3001;
 const isProduction = process.env.NODE_ENV === 'production';
+const MAX_WS_SESSION_MS = Number(process.env.MAX_WS_SESSION_MS || 10 * 60 * 1000);
+const WS_HEARTBEAT_MS = Number(process.env.WS_HEARTBEAT_MS || 30 * 1000);
+const WS_UPGRADE_RATE_LIMIT = Number(process.env.WS_UPGRADE_RATE_LIMIT || 20);
+const WS_UPGRADE_RATE_WINDOW_MS = Number(process.env.WS_UPGRADE_RATE_WINDOW_MS || 60 * 1000);
+const WS_MAX_CONCURRENT_PER_IP = Number(process.env.WS_MAX_CONCURRENT_PER_IP || 3);
 // Common middleware
 app.use(express.json());
 // API Routes
@@ -20,7 +26,21 @@ if (isProduction) {
     const distPath = path.resolve(process.cwd(), 'dist');
     console.log(`[Server] Production mode: Serving static files from ${distPath}`);
     if (fs.existsSync(distPath)) {
-        app.use(express.static(distPath));
+        app.use(express.static(distPath, {
+            etag: true,
+            lastModified: true,
+            setHeaders: (res, filePath) => {
+                if (filePath.endsWith('index.html')) {
+                    res.setHeader('Cache-Control', 'no-cache');
+                    return;
+                }
+                if (filePath.includes(`${path.sep}assets${path.sep}`)) {
+                    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+                    return;
+                }
+                res.setHeader('Cache-Control', 'public, max-age=3600');
+            },
+        }));
         // SPA fallback: redirect all unhandled requests to index.html (Express 5 wildcard syntax)
         app.get('*any', (req, res) => {
             res.sendFile(path.join(distPath, 'index.html'));
@@ -43,18 +63,83 @@ else {
 const httpServer = createServer(app);
 // Initialize WebSocket Server
 const wss = new WebSocketServer({ noServer: true });
+const allowedOrigins = new Set([process.env.APP_URL, ...(process.env.ALLOWED_ORIGINS || '').split(',')]
+    .map((origin) => origin?.trim())
+    .filter(Boolean));
+const isAllowedOrigin = (origin) => {
+    if (!isProduction)
+        return true;
+    if (!origin)
+        return false;
+    return allowedOrigins.has(origin);
+};
+const getClientIp = (request) => {
+    const forwarded = request.headers['x-forwarded-for'];
+    if (typeof forwarded === 'string' && forwarded.trim()) {
+        return forwarded.split(',')[0].trim();
+    }
+    if (Array.isArray(forwarded) && forwarded[0]) {
+        return forwarded[0].split(',')[0].trim();
+    }
+    return request.socket.remoteAddress || 'unknown';
+};
+const rejectUpgrade = (socket, statusCode, reason, retryAfterMs) => {
+    const retryHeader = retryAfterMs !== undefined ? `Retry-After: ${Math.ceil(retryAfterMs / 1000)}\r\n` : '';
+    socket.write(`HTTP/1.1 ${statusCode} ${reason}\r\n${retryHeader}Connection: close\r\n\r\n`);
+    socket.destroy();
+};
+let voiceConfigCache = {};
+const loadVoiceConfig = () => {
+    try {
+        const configPath = path.resolve(process.cwd(), 'src/translinkconfig/live-voice/voice_config.json');
+        if (!fs.existsSync(configPath))
+            return;
+        voiceConfigCache = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+        console.log('[Server] Voice configuration loaded.');
+    }
+    catch (err) {
+        console.error('[Server] Error loading voice config:', err);
+        voiceConfigCache = {};
+    }
+};
+const getSelectedVoice = (lang) => {
+    const langConfig = voiceConfigCache[lang] || voiceConfigCache.en;
+    if (langConfig?.activeVoice)
+        return langConfig.activeVoice;
+    if (langConfig?.voices) {
+        const active = Object.keys(langConfig.voices).find((k) => langConfig.voices[k] === 1);
+        if (active)
+            return active;
+    }
+    return 'Zephyr';
+};
+loadVoiceConfig();
 // Handle WebSocket upgrade manually
 httpServer.on('upgrade', (request, socket, head) => {
     try {
         const url = new URL(request.url || '', `http://${request.headers.host || 'localhost'}`);
         if (url.pathname === '/ws/live') {
+            if (!isAllowedOrigin(request.headers.origin)) {
+                rejectUpgrade(socket, 403, 'Forbidden');
+                return;
+            }
+            const ip = getClientIp(request);
+            const rateResult = rateLimitService.check(`ws-live-upgrade:${ip}`, WS_UPGRADE_RATE_LIMIT, WS_UPGRADE_RATE_WINDOW_MS);
+            if (!rateResult.allowed) {
+                rejectUpgrade(socket, 429, 'Too Many Requests', rateResult.retryAfterMs);
+                return;
+            }
+            if (!rateLimitService.tryAcquireVoiceSession(ip, WS_MAX_CONCURRENT_PER_IP)) {
+                rejectUpgrade(socket, 429, 'Too Many Concurrent Voice Sessions');
+                return;
+            }
             wss.handleUpgrade(request, socket, head, (ws) => {
+                ws.once('close', () => rateLimitService.releaseVoiceSession(ip));
                 wss.emit('connection', ws, request);
             });
         }
         else {
-            socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
-            socket.destroy();
+            rejectUpgrade(socket, 404, 'Not Found');
         }
     }
     catch (err) {
@@ -71,6 +156,7 @@ const service = new GeminiLiveService(apiKey);
 wss.on('connection', async (clientWs, request) => {
     console.log('[Server] Client connected to WebSocket');
     let lang = 'en';
+    let welcome = true;
     try {
         const url = new URL(request.url || '', `http://${request.headers.host || 'localhost'}`);
         const rawLang = url.searchParams.get('lang') || 'en';
@@ -78,35 +164,40 @@ wss.on('connection', async (clientWs, request) => {
         if (lang !== 'en' && lang !== 'am' && lang !== 'ar') {
             lang = 'en';
         }
+        const rawWelcome = url.searchParams.get('welcome');
+        if (rawWelcome === 'false') {
+            welcome = false;
+        }
     }
     catch (e) {
         console.error('[Server] Error parsing connection request URL lang param:', e);
     }
-    let selectedVoice = 'Zephyr';
-    try {
-        const configPath = path.resolve(process.cwd(), 'src/translinkconfig/live-voice/voice_config.json');
-        if (fs.existsSync(configPath)) {
-            const raw = fs.readFileSync(configPath, 'utf8');
-            const voiceConfig = JSON.parse(raw);
-            const langConfig = voiceConfig[lang] || voiceConfig['en'];
-            if (langConfig) {
-                if (langConfig.activeVoice) {
-                    selectedVoice = langConfig.activeVoice;
-                }
-                else if (langConfig.voices) {
-                    const active = Object.keys(langConfig.voices).find((k) => langConfig.voices[k] === 1);
-                    if (active)
-                        selectedVoice = active;
-                }
-            }
+    const selectedVoice = getSelectedVoice(lang);
+    let isAlive = true;
+    clientWs.on('pong', () => {
+        isAlive = true;
+    });
+    const heartbeat = setInterval(() => {
+        if (!isAlive) {
+            clientWs.terminate();
+            return;
         }
-    }
-    catch (err) {
-        console.error('[Server] Error loading voice config:', err);
-    }
+        isAlive = false;
+        clientWs.ping();
+    }, WS_HEARTBEAT_MS);
+    const maxSessionTimer = setTimeout(() => {
+        if (clientWs.readyState === clientWs.OPEN) {
+            clientWs.send(JSON.stringify({ error: 'Voice session reached the maximum duration.' }));
+            clientWs.close(1000, 'max_session_duration');
+        }
+    }, MAX_WS_SESSION_MS);
+    clientWs.on('close', () => {
+        clearInterval(heartbeat);
+        clearTimeout(maxSessionTimer);
+    });
     try {
-        console.log(`[Server] Handing off client to GeminiLiveService (lang: ${lang}, voice: ${selectedVoice})`);
-        await service.handleConnection(clientWs, lang, selectedVoice);
+        console.log(`[Server] Handing off client to GeminiLiveService (lang: ${lang}, voice: ${selectedVoice}, welcome: ${welcome})`);
+        await service.handleConnection(clientWs, lang, selectedVoice, welcome);
     }
     catch (err) {
         console.error('[Server] GeminiLiveService connection handoff failed:', err);

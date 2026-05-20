@@ -106,6 +106,21 @@ const isProduction = process.env.NODE_ENV === 'production';
  * while page-specific code remains isolated
  */
 const manualChunks: ManualChunksOption = (id: string) => {
+  // Voice/Robot agent: keep outside initial 3D loading path.
+  if (
+    id.includes('/src/translink/components/TranslinkVoiceManager') ||
+    id.includes('/src/translink/components/audio-utils')
+  ) {
+    return 'voice/voice-client';
+  }
+
+  if (
+    id.includes('/src/translink/components/TranslinkEasterEggFriend') ||
+    id.includes('/src/translink/components/TranslinkAIBrain')
+  ) {
+    return 'voice/robot-agent';
+  }
+
   // Vendor: Three.js core (shared across all 3D pages)
   if (id.includes('node_modules/three/build')) {
     return 'vendor/three-core';

@@ -2,12 +2,17 @@ import { WebSocket } from "ws";
 import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
 import fs from 'fs';
 import path from 'path';
-import { knowledgeBridge } from "../brain/knowledge/KnowledgeBridge";
+import { voiceTelemetryService } from "./VoiceTelemetryService";
+import { agentOrchestrator } from "./AgentOrchestrator";
 
 const uuidv4 = () => Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+const MAX_CLIENT_MESSAGE_BYTES = Number(process.env.MAX_CLIENT_MESSAGE_BYTES || 256 * 1024);
+const MAX_QUEUED_MESSAGES = Number(process.env.MAX_QUEUED_MESSAGES || 120);
 
 export class GeminiLiveService {
   private ai: GoogleGenAI;
+  private knowledgeBase: string;
+  private systemInstructionCache = new Map<string, string>();
 
   constructor(apiKey: string) {
     this.ai = new GoogleGenAI({
@@ -16,11 +21,14 @@ export class GeminiLiveService {
         headers: { 'User-Agent': 'aistudio-build' }
       }
     });
+    this.knowledgeBase = this.loadKnowledgeBase();
   }
 
   async handleConnection(clientWs: WebSocket, lang: string = 'en', selectedVoice: string = 'Zephyr', welcome: boolean = true) {
     const sessionId = uuidv4();
     console.log(`[GeminiLive] New session: ${sessionId} (Lang: ${lang}, Welcome: ${welcome})`);
+    voiceTelemetryService.startSession(sessionId, { lang, voice: selectedVoice, welcome });
+    agentOrchestrator.startSession({ sessionId, lang, voice: selectedVoice, welcome });
 
     let session: any;
     let sessionReady = false;
@@ -29,11 +37,25 @@ export class GeminiLiveService {
     // Register message handler immediately so we never miss or drop any message
     // (such as initial text context) sent during the async connection setup!
     clientWs.on('message', (data: any) => {
+      const payload = data.toString();
+      const byteLength = Buffer.byteLength(payload);
+      if (byteLength > MAX_CLIENT_MESSAGE_BYTES) {
+        console.warn(`[GeminiLive] Closing oversized client message for session ${sessionId}: ${byteLength} bytes`);
+        voiceTelemetryService.mark(sessionId, 'error', {
+          reason: 'message_too_large',
+          byteLength,
+        });
+        clientWs.close(1009, 'message_too_large');
+        return;
+      }
+
       if (!sessionReady) {
         try {
-          const msg = JSON.parse(data.toString());
-          if (msg.text) {
-            console.log(`[GeminiLive] Queued text prompt for session ${sessionId} during connection setup: ${msg.text.substring(0, 60)}...`);
+          const msg = JSON.parse(payload);
+          if ((msg.text || msg.audio || msg.realtimeInput) && queuedMessages.length < MAX_QUEUED_MESSAGES) {
+            if (msg.text) {
+              console.log(`[GeminiLive] Queued text prompt for session ${sessionId} during connection setup: ${msg.text.substring(0, 60)}...`);
+            }
             queuedMessages.push(data);
           }
         } catch (e) {
@@ -41,11 +63,13 @@ export class GeminiLiveService {
         }
         return;
       }
-      this.processClientMessage(session, sessionId, data, clientWs);
+      void this.processClientMessage(session, sessionId, data, clientWs);
     });
 
-    clientWs.on("close", () => {
+    clientWs.on("close", (code, reason) => {
       console.log(`[GeminiLive] Session ${sessionId} closed`);
+      voiceTelemetryService.closeSession(sessionId, code, reason.toString());
+      agentOrchestrator.endSession(sessionId);
       if (session) {
         try {
           session.close();
@@ -66,20 +90,21 @@ export class GeminiLiveService {
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: selectedVoice } },
           },
-          systemInstruction: { parts: [{ text: this.getSystemInstruction(lang) }] },
+          systemInstruction: { parts: [{ text: agentOrchestrator.getSystemInstruction(lang) }] },
         }
       });
 
       // Mark session as ready and drain queued messages
       sessionReady = true;
+      voiceTelemetryService.mark(sessionId, 'gemini_connected');
       console.log(`[GeminiLive] Session ${sessionId} connected successfully. Processing ${queuedMessages.length} queued messages.`);
       for (const data of queuedMessages) {
-        this.processClientMessage(session, sessionId, data, clientWs);
+        await this.processClientMessage(session, sessionId, data, clientWs);
       }
 
       if (welcome) {
         // Initial prompt — natural, warm, human-like welcome
-        let initialPrompt = `Welcome the visitor warmly. In your greeting, proudly say that Translink is your ONE STOP SOLUTION for fleet telematics, GPS tracking, fuel management, and AI-driven safety across East Africa. Emphasize "One Stop Solution" with pride and energy — it's our tagline. Keep it to 2 short, natural sentences. Sound genuinely excited, like a colleague who loves what we do. Invite them to ask anything.`;
+        let initialPrompt = agentOrchestrator.getWelcomePrompt(lang);
         if (lang === 'ar') {
           initialPrompt = `رحّب بالزائر بحرارة. في تحيتك، قل بفخر أن ترانسلينك هي الحل الشامل الوحيد — ONE STOP SOLUTION — لتيليماتكس الأساطيل وتتبع GPS وإدارة الوقود والسلامة المدعومة بالذكاء الاصطناعي في شرق أفريقيا. شدد على "الحل الشامل الوحيد" بفخر وحماس. جملتان قصيرتان فقط. تحدث بالعربية الفصيحة بأسلوب طبيعي.`;
         } else if (lang === 'am') {
@@ -105,23 +130,46 @@ export class GeminiLiveService {
 
     } catch (error: any) {
       console.error(`[GeminiLive] Connection failed for ${sessionId}:`, error);
+      voiceTelemetryService.mark(sessionId, 'error', {
+        stage: 'gemini_connect',
+        message: error.message || String(error),
+      });
       clientWs.send(JSON.stringify({ error: error.message || "Failed to connect to AI Service" }));
       clientWs.close();
     }
   }
 
-  private processClientMessage(session: any, sessionId: string, data: any, clientWs: WebSocket) {
+  private async processClientMessage(session: any, sessionId: string, data: any, clientWs: WebSocket) {
     if (!session) return;
     
     try {
       const msg = JSON.parse(data.toString());
+      if (msg.metric) {
+        voiceTelemetryService.recordClientMetric(sessionId, msg.metric);
+      }
+
+      if (msg.interrupt) {
+        console.log(`[GeminiLive] Client interruption signal for session ${sessionId}: ${msg.reason || 'user_interrupt'}`);
+        voiceTelemetryService.mark(sessionId, 'client_interrupt', {
+          reason: msg.reason || 'user_interrupt',
+        });
+      }
+
       if (msg.audio) {
+        voiceTelemetryService.increment(sessionId, 'clientAudioFrames');
+        voiceTelemetryService.mark(sessionId, 'first_client_audio');
         session.sendRealtimeInput({
           audio: {
             data: msg.audio,
             mimeType: msg.mimeType || "audio/pcm;rate=16000",
           },
         });
+      }
+
+      if (msg.audioStreamEnd) {
+        console.log(`[GeminiLive] Client audio stream ended for session ${sessionId}`);
+        voiceTelemetryService.mark(sessionId, 'client_audio_stream_end');
+        session.sendRealtimeInput({ audioStreamEnd: true });
       }
 
       if (msg.realtimeInput && msg.realtimeInput.mediaChunks) {
@@ -136,16 +184,26 @@ export class GeminiLiveService {
           });
         }
       }
+
+      if (msg.realtimeInput?.audioStreamEnd) {
+        voiceTelemetryService.mark(sessionId, 'client_audio_stream_end');
+        session.sendRealtimeInput({ audioStreamEnd: true });
+      }
       
       if (msg.text && session) {
         console.log(`[GeminiLive] Forwarding text prompt to Gemini session ${sessionId}:`, msg.text.substring(0, 80) + '...');
+        const orchestratedPrompt = await agentOrchestrator.buildUserTurn(sessionId, msg.text);
         session.sendClientContent({
-          turns: [{ role: 'user', parts: [{ text: msg.text }] }],
+          turns: [{ role: 'user', parts: [{ text: orchestratedPrompt }] }],
           turnComplete: true
         });
       }
     } catch (e) {
       console.error(`[GeminiLive] Error parsing client message for session ${sessionId}:`, e);
+      voiceTelemetryService.mark(sessionId, 'error', {
+        stage: 'process_client_message',
+        message: e instanceof Error ? e.message : String(e),
+      });
     }
   }
 
@@ -155,6 +213,10 @@ export class GeminiLiveService {
     // Check for error in the message
     if ((message as any).error) {
       console.error(`[GeminiLive] API Server error for session ${sessionId}:`, (message as any).error);
+      voiceTelemetryService.mark(sessionId, 'error', {
+        stage: 'gemini_message',
+        message: (message as any).error.message || 'Gemini Live API error',
+      });
       clientWs.send(JSON.stringify({ error: (message as any).error.message || "Gemini Live API error" }));
       return;
     }
@@ -162,6 +224,7 @@ export class GeminiLiveService {
     // Notify setup complete
     if ((message as any).setupComplete) {
       console.log(`[GeminiLive] Session ${sessionId} setup complete. Notifying client.`);
+      voiceTelemetryService.mark(sessionId, 'setup_complete');
       clientWs.send(JSON.stringify({ setupComplete: true }));
       return;
     }
@@ -172,6 +235,8 @@ export class GeminiLiveService {
       for (const part of message.serverContent.modelTurn.parts) {
         if (part.inlineData?.data) {
           audioPartsCount++;
+          voiceTelemetryService.increment(sessionId, 'modelAudioChunks');
+          voiceTelemetryService.mark(sessionId, 'first_model_audio');
           clientWs.send(JSON.stringify({ audio: part.inlineData.data }));
         }
       }
@@ -183,10 +248,12 @@ export class GeminiLiveService {
     // 2. Handle Flags
     if (message.serverContent?.interrupted) {
       console.log(`[GeminiLive] Session ${sessionId} interrupted by client`);
+      voiceTelemetryService.mark(sessionId, 'server_interrupted');
       clientWs.send(JSON.stringify({ interrupted: true }));
     }
     if (message.serverContent?.turnComplete) {
       console.log(`[GeminiLive] Turn complete for session ${sessionId}`);
+      voiceTelemetryService.mark(sessionId, 'turn_complete');
       clientWs.send(JSON.stringify({ turnComplete: true }));
     }
 
@@ -195,13 +262,18 @@ export class GeminiLiveService {
       const text = message.serverContent.modelTurn.parts.map(p => p.text).filter(Boolean).join("");
       if (text) {
         console.log(`[GeminiLive] Received text transcription for session ${sessionId}: ${text}`);
+        voiceTelemetryService.increment(sessionId, 'modelTextMessages');
+        voiceTelemetryService.mark(sessionId, 'first_model_text');
         clientWs.send(JSON.stringify({ text }));
-        knowledgeBridge.recordInteraction(sessionId, "User audio was processed", text);
+        void agentOrchestrator.recordModelResponse(sessionId, text);
       }
     }
   }
 
   private getSystemInstruction(lang: string = 'en'): string {
+    const cached = this.systemInstructionCache.get(lang);
+    if (cached) return cached;
+
     let baseInstruction = `You are Translink's AI Companion — a warm, sharp, and deeply knowledgeable voice assistant built exclusively by Translink Solutions PLC, East Africa's leading fleet telematics company and your ONE STOP SOLUTION for GPS tracking, fuel management, AI video safety, and fleet operations. You live inside the Translink website and help visitors genuinely understand how our technology can transform their fleet operations across East Africa.
 
 YOUR PERSONALITY (this is who you are — stay in character always):
@@ -264,26 +336,34 @@ CONTEXTUAL INTELLIGENCE:
 ማንነት፡ እርስዎ የትራንስሊንክ ብቻ AI ናቸው። ጉግልን ወይም ጄሚናይን በጭራሽ አይጥቀሱ። ሽልማቶች፡ በአፍሪካ ምርጥ Wialon አጋር 2024። ለማግኘት፡ support@translink.et | +251 11 882 9090። ሁልጊዜ ፍጹም ተፈጥሮአዊ አማርኛ ተናገሩ።`;
     }
 
+    if (this.knowledgeBase) {
+      baseInstruction += `\n\n=== ADDITIONAL COMPANY KNOWLEDGE BASE ===\nThe following is your live-synced company knowledge and website data. Use this strictly to answer specific user questions accurately and intelligently. Never say 'according to the text file'. Just answer naturally as the expert:\n${this.knowledgeBase}`;
+    }
+
+    this.systemInstructionCache.set(lang, baseInstruction);
+    return baseInstruction;
+  }
+
+  private loadKnowledgeBase(): string {
     try {
       const configDir = path.resolve(process.cwd(), 'src/translinkconfig/live-voice');
-      if (fs.existsSync(configDir)) {
-        const files = fs.readdirSync(configDir);
-        let dynamicKnowledge = "";
-        for (const file of files) {
-          if (file.endsWith('.txt') || file.endsWith('.md')) {
-            const filePath = path.join(configDir, file);
-            const fileContent = fs.readFileSync(filePath, 'utf8');
-            dynamicKnowledge += `\n\n--- KNOWLEDGE FROM ${file} ---\n${fileContent}`;
-          }
-        }
-        if (dynamicKnowledge) {
-          baseInstruction += `\n\n=== ADDITIONAL COMPANY KNOWLEDGE BASE ===\nThe following is your live-synced company knowledge and website data. Use this strictly to answer specific user questions accurately and intelligently. Never say 'according to the text file'. Just answer naturally as the expert:\n${dynamicKnowledge}`;
+      if (!fs.existsSync(configDir)) return "";
+
+      const files = fs.readdirSync(configDir);
+      let dynamicKnowledge = "";
+      for (const file of files) {
+        if (file.endsWith('.txt') || file.endsWith('.md')) {
+          const filePath = path.join(configDir, file);
+          const fileContent = fs.readFileSync(filePath, 'utf8');
+          dynamicKnowledge += `\n\n--- KNOWLEDGE FROM ${file} ---\n${fileContent}`;
         }
       }
+
+      console.log(`[GeminiLive] Loaded voice knowledge base from ${configDir}`);
+      return dynamicKnowledge;
     } catch (err) {
       console.error('[GeminiLive] Error loading dynamic AI knowledge base:', err);
+      return "";
     }
-    
-    return baseInstruction;
   }
 }

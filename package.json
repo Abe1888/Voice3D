@@ -15,7 +15,8 @@
     "clean": "rimraf dist node_modules dist-server",
     "clean:cache": "rimraf node_modules/.vite",
     "server:dev": "tsx server/index.ts",
-    "server:start": "tsx server/index.ts"
+    "server:start": "tsx server/index.ts",
+    "voice:readiness": "tsx scripts/voice-readiness-check.ts"
   },
   "dependencies": {
     "@google/genai": "^2.3.0",
