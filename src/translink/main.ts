@@ -28,7 +28,6 @@ import { TranslinkLanguageToggle } from './components/TranslinkLanguageToggle';
 import { TranslinkCursorController } from './controllers/TranslinkCursorController';
 import { TranslinkGlobalDecorations } from './components/TranslinkGlobalDecorations';
 import { TranslinkClientLogoScroll } from './components/TranslinkClientLogoScroll';
-import { TranslinkEasterEggFriend } from './components/TranslinkEasterEggFriend';
 
 // TranslinkWorldAdapter bridges World's #flow-content scroll binding
 // into our #app-based translink architecture.
@@ -111,7 +110,7 @@ async function init() {
     // This strictly ensures web fonts are loaded and layout is paint-committed
     // before GSAP initializes, guaranteeing accurate ScrollTrigger measurements.
     document.fonts.ready.then(() => {
-        requestAnimationFrame(() => {
+        requestAnimationFrame(async () => {
             const logoAnimator = new TranslinkLogoAnimator();
             logoAnimator.setup();
 
@@ -147,13 +146,16 @@ async function init() {
                 },
                 { passive: true }
             );
-            // Finalize: Hide the robot loader
-            loader.hide();
+            // Finalize: hide the robot loader before mounting the Robot/Voice layer.
+            // This preserves the production loading contract: no Robot, voice engine,
+            // microphone, socket, or AI session initializes during 3D asset loading.
+            await loader.hide();
 
             // ── Global Easter Egg Companion ────────────────────────────────
             // Mount the singleton LAST so it sits above all other layers.
             // All section TelemetryButtons share this single instance and
             // call carryButton() / returnHome() on it via ScrollTrigger.
+            const { TranslinkEasterEggFriend } = await import('./components/TranslinkEasterEggFriend');
             TranslinkEasterEggFriend.reset(); // Clear any stale instance from HMR
             TranslinkEasterEggFriend.getInstance().mount(document.body);
         });
